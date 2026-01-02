@@ -1,0 +1,311 @@
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const pino = require("pino");
+const multer = require("multer");
+const {
+    makeInMemoryStore,
+    useMultiFileAuthState,
+    delay,
+    makeCacheableSignalKeyStore,
+    Browsers,
+    fetchLatestBaileysVersion,
+    makeWASocket,
+    isJidBroadcast
+} = require("@whiskeysockets/baileys");
+
+const app = express();
+const PORT = 21562;
+
+// Create necessary directories
+if (!fs.existsSync("temp")) fs.mkdirSync("temp");
+if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
+
+const upload = multer({ dest: "uploads/" });
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Store active client instances and tasks
+const activeClients = new Map();
+const activeTasks = new Map();
+
+app.get("/", (req, res) => {
+    res.send(`
+    <html>
+    <head>
+    <title>WhatsApp Server </title>
+    <style>
+    body {
+        background: #0a0a2a;
+        background-image: radial-gradient(circle at 15% 15%, rgba(255, 255, 200, 0.8) 0%, transparent 20%),
+                          radial-gradient(circle at 85% 25%, rgba(255, 255, 255, 0.5) 0%, transparent 3%);
+        color: #e0e0ff;
+        text-align: center;
+        font-size: 20px;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        min-height: 100vh;
+        padding: 20px;
+        margin: 0;
+    }
+    .container { max-width: 800px; margin: 0 auto; }
+    .box {
+        background: rgba(10, 20, 40, 0.85);
+        padding: 30px;
+        border-radius: 15px;
+        margin: 25px auto;
+        border: 1px solid #4d4dff;
+        box-shadow: 0 0 15px rgba(100, 100, 255, 0.3);
+    }
+    h1, h2, h3 { color: #4deeea; margin-top: 0; }
+    button {
+        background: linear-gradient(to right, #4deeea, #74ee15, #ffe700, #f000ff);
+        color: #0a0a2a;
+        border: none;
+        cursor: pointer;
+        font-weight: bold;
+        padding: 15px;
+        font-size: 20px;
+        border-radius: 8px;
+        transition: transform 0.3s;
+    }
+    button:hover { transform: translateY(-3px); }
+    a {
+        color: #4deeea;
+        text-decoration: none;
+        font-weight: bold;
+        font-size: 18px;
+        display: inline-block;
+        margin-top: 20px;
+        padding: 10px 20px;
+        border-radius: 8px;
+        border: 1px solid #4deeea;
+    }
+    </style>
+    </head>
+    <body>
+    <div class="container">
+        <h1>WhatsApp Server </h1>
+        
+        <div class="box">
+            <form id="pairingForm">
+                <input type="text" id="numberInput" name="number" placeholder="Enter Your WhatsApp Number (with country code)" required>
+                <button type="button" onclick="generatePairingCode()">Generate Pairing Code</button>
+            </form>
+            <div id="pairingResult"></div>
+        </div>
+
+        <div class="box">  
+            <form action="/send-message" method="POST" enctype="multipart/form-data">  
+                <select name="targetType" required>  
+                    <option value="">-- Select Target Type --</option>  
+                    <option value="number">Target Number</option>  
+                    <option value="group">Group UID</option>  
+                </select>  
+                <input type="text" name="target" placeholder="Enter Target Number / Group UID" required>  
+                <input type="file" name="messageFile" accept=".txt" required>  
+                <input type="text" name="prefix" placeholder="Enter Message Prefix (optional)">  
+                <input type="number" name="delaySec" placeholder="Delay in Seconds (between messages)" min="1" required>  
+                <button type="submit">Start Sending Messages</button>  
+            </form>  
+        </div>  
+
+        <div class="box">  
+            <form id="showTaskForm">
+                <button type="button" onclick="showMyTaskId()">Show My Task ID</button>
+                <div id="taskIdDisplay"></div>
+            </form>
+        </div>
+
+        <div class="box">  
+            <form action="/stop-task" method="POST">  
+                <input type="text" name="taskId" placeholder="Enter Your Task ID to Stop" required>  
+                <button type="submit">Stop My Task</button>  
+            </form>  
+        </div>  
+
+        <div class="box">
+            <h3>Active Sessions: ${activeClients.size}</h3>  
+            <h3>Active Tasks: ${activeTasks.size}</h3>
+            <a href="/get-groups"></a>
+        </div>
+    </div>
+
+    <script>
+        async function generatePairingCode() {
+            const number = document.getElementById('numberInput').value;
+            if (!number) return alert('Please enter a valid WhatsApp number');
+            const response = await fetch('/code?number=' + encodeURIComponent(number));
+            document.getElementById('pairingResult').innerHTML = await response.text();
+        }
+        function showMyTaskId() {
+            const taskId = localStorage.getItem('wa_task_id');
+            const div = document.getElementById('taskIdDisplay');
+            div.innerHTML = taskId ? '<h3>Your Task ID:</h3><h2>' + taskId + '</h2>' : '<p>No task found.</p>';
+        }
+    </script>
+    </body>  
+    </html>
+    `);
+});
+
+app.get("/code", async (req, res) => {
+    const num = req.query.number.replace(/[^0-9]/g, "");
+    const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+    const sessionPath = path.join("temp", sessionId);
+    if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true });
+
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+        const { version } = await fetchLatestBaileysVersion();
+        
+        const waClient = makeWASocket({
+            version,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }))
+            },
+            printQRInTerminal: false,
+            logger: pino({ level: "fatal" }),
+            browser: Browsers.ubuntu('Chrome'),
+            syncFullHistory: false
+        });
+
+        if (!waClient.authState.creds.registered) {
+            await delay(1500);
+            const code = await waClient.requestPairingCode(num);
+            activeClients.set(sessionId, { client: waClient, number: num, authPath: sessionPath });
+            return res.send(`
+                <div style="padding:20px; background:#142850; border-radius:10px; color:#4deeea;">
+                    <h2>Pairing Code: ${code}</h2>
+                    <p>Open WhatsApp → Linked Devices → Link a Device → Enter this code</p>
+                    <a href="/">Go Back</a>
+                </div>
+            `);
+        }
+
+        waClient.ev.on("creds.update", saveCreds);
+    } catch (err) {
+        res.send(`<div>Error: ${err.message}<br><a href="/">Go Back</a></div>`);
+    }
+});
+
+
+app.get("/get-groups", async (req, res) => {
+    try {
+        let sessionId;
+        let clientInfo;
+        for (const [key, value] of activeClients.entries()) {
+            sessionId = key;
+            clientInfo = value;
+            break;
+        }
+
+        if (!sessionId || !clientInfo) {
+            return res.send(`<div class="box"><h2>Error:  WhatsApp </h2><a href="/"></a></div>`);
+        }
+
+        const { client: waClient } = clientInfo;
+        const groups = await waClient.groupFetchAllParticipating();
+
+        let html = `
+        <html><head><title>vv</title>
+        <style>
+        body{background:#0a0a2a;color:#e0e0ff;font-family:sans-serif;text-align:center;padding:20px;}
+        .group{background:rgba(20,40,60,0.8);margin:10px auto;padding:15px;border-radius:10px;max-width:700px;border:1px solid #4deeea;}
+        .group span{color:#74ee15;display:block;margin-top:5px;}
+        a{color:#4deeea;text-decoration:none;border:1px solid #4deeea;padding:10px 20px;border-radius:8px;margin-top:20px;display:inline-block;}
+        </style></head><body>
+        <h1>whatsapp  </h1>`;
+        for (const id in groups) {
+            const g = groups[id];
+            html += `<div class="group"><strong>${g.subject}</strong><span>UID: ${g.id}</span></div>`;
+        }
+        html += `<a href="/"<>/a></body></html>`;
+        res.send(html);
+    } catch (error) {
+        res.send(`<div>Error fetching groups: ${error.message}<a href="/">Back</a></div>`);
+    }
+});
+
+app.post("/send-message", upload.single("messageFile"), async (req, res) => {
+    const { target, targetType, delaySec, prefix } = req.body;
+    const taskId = `task_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+
+    let sessionId;
+    let clientInfo;
+    for (const [key, value] of activeClients.entries()) {
+        sessionId = key;
+        clientInfo = value;
+        break;
+    }
+
+    if (!clientInfo) return res.send(`<div>No active WhatsApp session found<br><a href="/">Back</a></div>`);
+
+    const { client: waClient } = clientInfo;
+    const filePath = req.file?.path;
+    if (!target || !filePath || !targetType || !delaySec)
+        return res.send(`<div>Missing fields<br><a href="/">Back</a></div>`);
+
+    try {
+        const messages = fs.readFileSync(filePath, "utf-8").split("\n").filter(Boolean);
+        let index = 0;
+        const taskInfo = { sessionId, isSending: true, stopRequested: false, totalMessages: messages.length, sentMessages: 0, target, startTime: new Date() };
+        activeTasks.set(taskId, taskInfo);
+
+        res.send(`<script>localStorage.setItem('wa_task_id', '${taskId}');window.location.href='/task-status?taskId=${taskId}';</script>`);
+
+        while (taskInfo.isSending && !taskInfo.stopRequested && index < messages.length) {
+            let msg = prefix ? prefix + " " + messages[index] : messages[index];
+            const recipient = targetType === "group" ? target + "@g.us" : target + "@s.whatsapp.net";
+            await waClient.sendMessage(recipient, { text: msg });
+            console.log(`[${taskId}] Sent message to ${target}`);
+            taskInfo.sentMessages++;
+            index++;
+            await delay(delaySec * 1000 + Math.random() * 2000);
+        }
+
+        taskInfo.isSending = false;
+        taskInfo.endTime = new Date();
+    } catch (err) {
+        console.error(err);
+    } finally {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
+});
+
+app.get("/task-status", (req, res) => {
+    const taskId = req.query.taskId;
+    const taskInfo = activeTasks.get(taskId);
+    if (!taskInfo) return res.send(`<div>No such task<br><a href="/">Back</a></div>`);
+    res.send(`
+        <html><body style="background:#0a0a2a;color:#e0e0ff;text-align:center;font-family:sans-serif;">
+        <h1>Task Status</h1>
+        <h3>Task ID: ${taskId}</h3>
+        <p>Status: ${taskInfo.isSending ? "RUNNING" : "COMPLETED"}</p>
+        <p>Target: ${taskInfo.target}</p>
+        <p>Messages Sent: ${taskInfo.sentMessages}/${taskInfo.totalMessages}</p>
+        <a href="/">Home</a></body></html>
+    `);
+});
+
+app.post("/stop-task", (req, res) => {
+    const { taskId } = req.body;
+    const task = activeTasks.get(taskId);
+    if (!task) return res.send(`<div>No such task<br><a href="/">Back</a></div>`);
+    task.stopRequested = true;
+    task.isSending = false;
+    task.endTime = new Date();
+    res.send(`<div>Task ${taskId} stopped<br><a href="/">Home</a></div>`);
+});
+
+process.on('SIGINT', () => {
+    console.log('Shutting down...');
+    activeClients.forEach(({ client }, sessionId) => {
+        client.end();
+        console.log(`Closed connection for ${sessionId}`);
+    });
+    process.exit();
+});
+
+app.listen(PORT, () => console.log(`✅ Server running on http://localhost:${PORT}`));
